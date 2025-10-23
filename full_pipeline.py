@@ -16,7 +16,7 @@ FILE_PATH = "SOL PIONEER_ManualTabsExport_Fri Sep 26 2025.xlsx"
 HEADER_ROW_INDEX = 5
 MODEL_DIR = "models"
 SEQ_LEN = 3
-GEMINI_API_KEY = "AIzaSyDsJFn13vMfuZppKIIdDHhaPJRoA1F3Ysg" # Replace with your actual key
+GEMINI_API_KEY = "" # Replace with your actual key
 
 # --- Model Definitions ---
 HYDRO_MODEL_DEFINITIONS = {
