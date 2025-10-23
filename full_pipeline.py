@@ -7,6 +7,7 @@ import joblib
 import os
 import warnings
 import google.generativeai as genai
+import shap # Import SHAP
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -15,7 +16,7 @@ FILE_PATH = "SOL PIONEER_ManualTabsExport_Fri Sep 26 2025.xlsx"
 HEADER_ROW_INDEX = 5
 MODEL_DIR = "models"
 SEQ_LEN = 3
-GEMINI_API_KEY = "" # Replace with your actual key
+GEMINI_API_KEY = "AIzaSyDsJFn13vMfuZppKIIdDHhaPJRoA1F3Ysg" # Replace with your actual key
 
 # --- Model Definitions ---
 HYDRO_MODEL_DEFINITIONS = {
@@ -140,7 +141,7 @@ class ModelManager:
 
         residuals = y - model.predict(X)
         threshold = 3 * residuals.std()
-        return model, threshold, X
+        return model, threshold, X # Return full X data for SHAP
 
     def train_all_models(self, hydro_df, eta_nav_df):
         """Orchestrates the training of all models."""
@@ -149,7 +150,7 @@ class ModelManager:
             model, threshold, X_data = self._train_evaluate_regression_model(
                 hydro_df, config['target'], config['features']
             )
-            self._save_model(name, (model, threshold, X_data))
+            self._save_model(name, (model, threshold, X_data)) # Save X_data
 
         print("\n--- Training Navigation Models ---")
         # --- FIX 2: Use 'Speed_prev' in nav_features ---
@@ -157,7 +158,7 @@ class ModelManager:
         # -----------------------------------------------
         for target in ['LAT', 'LON']:
             model, threshold, X_data = self._train_evaluate_regression_model(eta_nav_df, target, nav_features)
-            self._save_model(f"{target}_Predictor", (model, threshold, X_data))
+            self._save_model(f"{target}_Predictor", (model, threshold, X_data)) # Save X_data
 
         print("\n--- Training ETA Model ---")
         # --- FIX 3: Use 'Speed_prev' in eta_features ---
@@ -167,7 +168,7 @@ class ModelManager:
         model, threshold, X_data = self._train_evaluate_regression_model(
             eta_nav_df, 'Remaining Time to PS', eta_features
         )
-        self._save_model("ETA_Predictor", (model, threshold, X_data))
+        self._save_model("ETA_Predictor", (model, threshold, X_data)) # Save X_data
         print("\nAll models trained and saved successfully.")
 
     def _save_model(self, model_name, model_data):
@@ -183,9 +184,18 @@ class ModelManager:
             if filename.endswith(".joblib"):
                 model_name = filename.replace(".joblib", "")
                 path = os.path.join(self.model_dir, filename)
-                model, threshold, X_data = joblib.load(path)
-                loaded_models[model_name] = {'model': model, 'threshold': threshold}
-                print(f"Loaded {model_name} from {path}")
+                try:
+                    # --- SHAP CHANGE: Load background data ---
+                    model, threshold, X_data = joblib.load(path)
+                    loaded_models[model_name] = {
+                        'model': model, 
+                        'threshold': threshold,
+                        'background_data': X_data # Store background data
+                    }
+                    print(f"Loaded {model_name} from {path}")
+                    # -----------------------------------------
+                except Exception as e:
+                    print(f"Error loading {filename}: {e}. Skipping.")
         return loaded_models
 
 
@@ -195,6 +205,27 @@ class AnomalyDetector:
     def __init__(self, models, api_key):
         self.models = models
         genai.configure(api_key=api_key)
+        
+        # --- SHAP CHANGE: Pre-calculate explainers ---
+        self.explainers = {}
+        print("\n--- Pre-calculating SHAP Explainers ---")
+        for name, config in self.models.items():
+            try:
+                model = config['model']
+                background = config['background_data']
+                
+                # Sample background data for performance if it's too large
+                if len(background) > 100:
+                    background = shap.sample(background, 100)
+                
+                # Use shap.Explainer for flexibility
+                explainer = shap.Explainer(model, background)
+                self.explainers[name] = explainer
+                print(f"  - Explainer created for {name}")
+            except Exception as e:
+                print(f"  - ⚠️ Could not create SHAP explainer for {name}: {e}")
+        # ---------------------------------------------
+
         self.llm = genai.GenerativeModel('gemini-2.5-flash') # Use a fast model
 
     def _prepare_single_report(self, raw_report_data):
@@ -225,16 +256,28 @@ class AnomalyDetector:
         )
         return report
 
-    def _get_llm_explanation(self, target_col, actual, predicted):
+    # --- SHAP CHANGE: Add shap_explanation_str to prompt ---
+    def _get_llm_explanation(self, target_col, actual, predicted, shap_explanation_str):
         """Generates a structured JSON explanation for an anomaly using an LLM."""
         prompt = f"""
         Analyze a vessel data anomaly.
+        
+        Data:
         - Feature: "{target_col}"
         - Reported Value: {actual:.2f}
-        - Expected Value: {predicted:.2f}
-        - Rule: Longitude (LON) must be between -180 and 180.
+        - Expected Value (from model): {predicted:.2f}
+        
+        Model Explanation (SHAP Feature Importance):
+        This shows *why* the model predicted the value it did. A high positive/negative value means that feature pushed the prediction up/down.
+        - {shap_explanation_str}
+        
+        Task:
         Generate a JSON object with keys "error", "summary", and "severity" ('error', 'warning', or 'info').
+        - "error": Concatenate the feature name, reported value, and expected value into a technical summary.
+        - "summary": Using the SHAP explanation, provide a *human-readable, actionable recommendation*. For example, if 'Cargo Weight' had a huge impact, suggest "Verify 'Cargo Weight' as it is strongly influencing the anomalous 'Draught Mean' prediction."
+        - "severity": Classify as 'error', 'warning', or 'info'.
         """
+        # -----------------------------------------------------
         try:
             response = self.llm.generate_content(
                 prompt,
@@ -256,14 +299,12 @@ class AnomalyDetector:
         anomalies = []
         anomaly_id = 1
 
-        # --- FIX 4: Use 'Speed_prev' in model_configs ---
         model_configs = {**HYDRO_MODEL_DEFINITIONS}
         model_configs.update({
             'LAT_Predictor': {'target': 'LAT', 'features': ['LAT_prev', 'LON_prev', 'Speed_prev', 'Heading']},
             'LON_Predictor': {'target': 'LON', 'features': ['LAT_prev', 'LON_prev', 'Speed_prev', 'Heading']},
             'ETA_Predictor': {'target': 'Remaining Time to PS', 'features': ['LAT', 'LON', 'LAT_prev', 'LON_prev', 'Speed_prev', 'Speed Logged [KN]', 'Remaining Distance to PS [NM]', 'Heading']}
         })
-        # --------------------------------------------------
         
         for name, config_info in self.models.items():
             model_name_key = name.split('.')[0] if '.' in name else name
@@ -288,8 +329,24 @@ class AnomalyDetector:
 
                 if abs(residual) > config_info['threshold']:
                     print(f"  🚩 Anomaly Detected in {target}!")
-                    llm_output = self._get_llm_explanation(target, actual, predicted)
-                    # --- FIX for Typo ---
+
+                    shap_explanation_str = "SHAP explanation not available."
+                    if model_name_key in self.explainers:
+                        try:
+                            explainer = self.explainers[model_name_key]
+                            shap_values = explainer(input_df) 
+                            
+                            shap_vals_for_row = shap_values.values[0]
+
+                            feature_importance = dict(zip(features, shap_vals_for_row))
+                            sorted_importance = sorted(feature_importance.items(), key=lambda item: abs(item[1]), reverse=True)
+                            importance_str = ", ".join([f"'{f}': {v:.3f}" for f, v in sorted_importance])
+                            shap_explanation_str = f"Feature contributions to prediction: [{importance_str}]"
+                        
+                        except Exception as e:
+                            print(f"  - ⚠️ SHAP explanation failed for {model_name_key}: {e}")
+                    
+                    llm_output = self._get_llm_explanation(target, actual, predicted, shap_explanation_str)
                     anomaly_obj = {
                         "id": anomaly_id,
                         "field": target,
@@ -297,7 +354,6 @@ class AnomalyDetector:
                         "summary": llm_output.get("summary"),
                         "severity": llm_output.get("severity", "warning").lower()
                     }
-                    # --------------------
                     if anomaly_obj["severity"] == "error":
                         anomaly_obj["comment"] = "Please resolve this issue before submission."
                     anomalies.append(anomaly_obj)
@@ -311,6 +367,12 @@ class AnomalyDetector:
 
 def main():
     """Main execution block for the vessel analytics pipeline."""
+    # Ensure file exists before proceeding
+    if not os.path.exists(FILE_PATH):
+        print(f"Error: Data file not found at {FILE_PATH}")
+        print("Please download the file and place it in the correct location.")
+        return
+
     processor = VesselDataProcessor(FILE_PATH, HEADER_ROW_INDEX)
     hydro_data, eta_nav_data = processor.get_processed_dataframes()
 
@@ -319,12 +381,16 @@ def main():
 
     loaded_models = trainer.load_all_models()
     
+    if not loaded_models:
+        print("No models were loaded. Aborting anomaly detection.")
+        return
+
     detector = AnomalyDetector(loaded_models, GEMINI_API_KEY)
 
     sample_report = {
         'Draught Fore [M]': 9.0, 'Draught Aft [M]': 9.5,
-        'Ballast Water [MT]': 2000, 'Cargo Weight [MT]': 60000, # Anomalous Cargo
-        'LAT': 9.37, 'LON': 200.22, # Anomalous LON
+        'Ballast Water [MT]': 2000, 'Cargo Weight [MT]': 60000,
+        'LAT': 9.37, 'LON': 200.22, 
         'LAT_prev': 16.05, 'LON_prev': 96.17,
         'Speed Logged [KN]': 13.1, 
         'Speed_prev': 12.5, # <-- Use 'Speed_prev' to match
